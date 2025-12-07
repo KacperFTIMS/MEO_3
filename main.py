@@ -28,47 +28,95 @@ class TransportSolver:
         self.basic_vars = None
         self.epsilon = 1e-9  # Globalna tolerancja dla zer
 
+        # Lista do przechowywania stanów macierzy alokacji i bazy
+        self.step_by_step_data = []
+
     def log(self, message):
         self.logs.append(message)
 
-    def log_matrix(self, title):
-        """Pomocnicza funkcja do ładnego wypisywania macierzy w logach"""
-        self.log(f"\n--- {title} ---")
-        if self.allocation is not None:
+    def display_table_in_logs(self, pretty_table_data, title):
+        """Pomocnicza funkcja generująca prostą tabelę w logach dla celów śledzenia kroków startowych."""
 
-            s = []
-            # Dodatkowa kolumna dla podaży
+        # Odtworzenie podstawowego formatowania tabularycznego dla logów operacyjnych
+        self.log(f"\n--- {title} ---")
+        s = pretty_table_data
+        if s:
+            # Użycie stałej szerokości dla czytelności (np. 8 znaków + margines)
+            lens = [max(map(len, col)) for col in zip(*s)]
+            # Ograniczenie szerokości do max 10 znaków, aby uniknąć nadmiernej szerokości
+            max_len = 10
+            lens = [min(l, max_len) for l in lens]
+
+            fmt = ' | '.join('{{:^{}}}'.format(x) for x in lens)
+            table = [fmt.format(*row) for row in s]
+
+            # Dodanie linii separującej nagłówki
+            sep_line = "-+-".join(["-" * l for l in lens])
+
+            self.log(sep_line)
+            # Wypisanie tabeli (bez ostatniego wiersza z sumą, który jest niepotrzebny w tym widoku)
+            self.log('\n'.join(table[:-1]))
+            self.log(sep_line)
+            self.log(f"{fmt.format(*s[-1])}")
+
+        self.log("-" * 30)
+
+    def log_matrix(self, title):
+        """
+        Pomocnicza funkcja do zapisywania stanu macierzy alokacji i kosztów
+        oraz wywoływania logowania do logów operacyjnych.
+        """
+
+        # ZAPIS STANU DO self.step_by_step_data
+        if self.allocation is not None and self.basic_vars is not None:
+            u, v = self.calculate_uv_without_degeneracy_fix()
+
+            # Tworzenie czytelnej reprezentacji tabeli dla logów (na potrzeby podsumowania)
             temp_alloc = np.hstack((self.allocation, self.supply.reshape(-1, 1)))
-            # Dodatkowy wiersz dla popytu
             temp_alloc = np.vstack((temp_alloc, np.append(self.demand, np.sum(self.supply))))
 
+            pretty_table_data = []
             for r_idx, row in enumerate(temp_alloc):
                 r_str = []
                 for c_idx, x in enumerate(row):
-                    if r_idx == self.rows and c_idx == self.cols:  # Prawy dolny róg (suma)
+                    is_sum_row_col = (r_idx == self.rows or c_idx == self.cols)
+
+                    if r_idx == self.rows and c_idx == self.cols:
                         r_str.append(f'={x:.0f}')
-                    elif r_idx == self.rows or c_idx == self.cols:  # Podaż/Popyt
+                    elif is_sum_row_col:
                         r_str.append(f'{x:.0f}')
                     elif abs(x) < self.epsilon:
-                        # Wypisujemy '0*' dla zmiennej bazowej zerowej
-                        if self.basic_vars[r_idx, c_idx]:
-                            r_str.append('0*')
-                        else:
-                            r_str.append('0')
+                        r_str.append('0*' if self.basic_vars[r_idx, c_idx] else '0')
                     elif x.is_integer():
-                        r_str.append(str(int(x)))
+                        r_str.append(str(int(x)) if abs(x) > self.epsilon else '0')
                     else:
                         r_str.append(f'{x:.2f}')
-                s.append(r_str)
+                pretty_table_data.append(r_str)
 
-            # Wyrównanie do prawej
-            if s:
-                lens = [max(map(len, col)) for col in zip(*s)]
-                fmt = '\t'.join('{{:>{}}}'.format(x) for x in lens)
-                table = [fmt.format(*row) for row in s]
-                self.log('\n'.join(table[:-1]))  # Bez sumy
-                self.log(fmt.format(*s[-1]))  # Sama suma
-        self.log("-" * 30)
+            # Zapis stanu do step_by_step_data
+            self.step_by_step_data.append({
+                'title': title,
+                'allocation': self.allocation.copy(),
+                'basic_vars': self.basic_vars.copy(),
+                'cost': self.get_total_cost(),
+                'rows': self.rows,
+                'cols': self.cols,
+                'supply': self.supply.copy(),
+                'demand': self.demand.copy(),
+                'cost_matrix': self.cost_matrix.copy(),
+                'pretty_table_data': pretty_table_data,  # Dane dla tabeli podsumowania
+                'u': u,
+                'v': v
+            })
+
+            # ZMIANA PRZYWRÓCONA: Wyświetlanie tabel w logach dla kroków startowych
+            if 'NW:' in title or 'Min. Macierzy:' in title or 'Min. Wiersza:' in title or 'Min. Kolumny:' in title:
+                self.display_table_in_logs(pretty_table_data, title)
+            else:
+                # Logowanie dla kroków MODI jest zwięzłe, bo pełna tabela jest poniżej
+                self.log(f"\n--- {title} ---")
+                self.log(f"    Całkowity koszt/zysk: {self.get_total_cost():.2f}")
+                self.log("-" * 30)
 
     def prepare_data(self):
         self.cost_matrix = self.original_cost_matrix.copy()
@@ -77,11 +125,8 @@ class TransportSolver:
 
         if self.type == 'max':
             self.log("Tryb Maksymalizacji: Negacja macierzy kosztów/zysków.")
-            # W Metodzie Potencjałów, aby dążyć do maksimum,
-            # zamieniamy problem na min. koszty ujemne (max. zyski)
             self.cost_matrix = -self.cost_matrix
 
-        # Wyczyść nieskończoności w S/D przed bilansowaniem
         temp_supply = self.supply[self.supply != float('inf')]
         temp_demand = self.demand[self.demand != float('inf')]
 
@@ -92,67 +137,66 @@ class TransportSolver:
             if total_supply > total_demand:
                 diff = total_supply - total_demand
                 self.log(
-                    f"BILANSOWANIE: Podaż ({total_supply:.2f}) > Popyt ({total_demand:.2f}). Dodano fikcyjnego odbiorcę: {diff:.2f}")
-                # Fikcyjny odbiorca - koszty 0
+                    f"Bilansowanie: Podaż ({total_supply:.2f}) > Popyt ({total_demand:.2f}). Dodano wirtualnego odbiorcę: {diff:.2f}")
                 dummy_col = np.zeros((self.cost_matrix.shape[0], 1))
                 self.cost_matrix = np.hstack((self.cost_matrix, dummy_col))
                 self.demand = np.append(self.demand, diff)
 
-            else:  # total_demand > total_supply
+            else:
                 diff = total_demand - total_supply
                 self.log(
-                    f"BILANSOWANIE: Popyt ({total_demand:.2f}) > Podaż ({total_supply:.2f}). Dodano fikcyjnego dostawcę: {diff:.2f}")
-                # Fikcyjny dostawca - koszty 0
+                    f"Bilansowanie: Popyt ({total_demand:.2f}) > Podaż ({total_supply:.2f}). Dodano wirtualnego dostawcę: {diff:.2f}")
                 dummy_row = np.zeros((1, self.cost_matrix.shape[1]))
                 self.cost_matrix = np.vstack((self.cost_matrix, dummy_row))
                 self.supply = np.append(self.supply, diff)
         else:
-            self.log(f"BILANSOWANIE: Zadanie jest zbilansowane (Suma: {total_supply:.2f}).")
+            self.log(f"Bilansowanie: Zadanie jest zbilansowane (Suma: {total_supply:.2f}).")
 
         self.rows = len(self.supply)
         self.cols = len(self.demand)
         self.allocation = np.zeros((self.rows, self.cols))
         self.basic_vars = np.zeros((self.rows, self.cols), dtype=bool)
 
-    # --- METODY STARTOWE (bez zmian) ---
+    # --- METODY STARTOWE (Z logowaniem kroków) ---
 
     def nw_corner_method(self):
-        """Metoda Kąta Północno-Zachodniego"""
-        self.log("\n>>> START: Metoda Kąta Północno-Zachodniego")
+        """Metoda Kąta Północno-Zachodniego (NW)"""
+        self.log("\nMetoda kąta północno - zachodniego")
         supply = self.supply.copy()
         demand = self.demand.copy()
         i, j = 0, 0
+        step = 1
         while i < self.rows and j < self.cols:
             quantity = min(supply[i], demand[j])
             self.allocation[i, j] = quantity
             self.basic_vars[i, j] = True
 
-            self.log(f"Przydzielono {quantity} -> Komórka [{i}, {j}]")
+            self.log(f"Krok NW {step}: Przydzielono {quantity} -> Komórka [{i}, {j}]")
+            self.log_matrix(f"NW Krok {step}")
 
             supply[i] -= quantity
             demand[j] -= quantity
 
             if abs(supply[i]) < self.epsilon and abs(demand[j]) < self.epsilon:
-                # W przypadku zerowego cyklu (dwie wartości jednocześnie się wyzerowały)
-                # Musimy dodać jedną ze zmiennych do bazy jako '0*'
                 if i + 1 < self.rows:
                     self.basic_vars[i + 1, j] = True
                     i += 1
                 elif j + 1 < self.cols:
                     self.basic_vars[i, j + 1] = True
                     j += 1
-                else:  # Ostatnie pole
-                    i += 1  # Wychodzimy z pętli
+                else:
+                    i += 1
             elif abs(supply[i]) < self.epsilon:
                 i += 1
             else:
                 j += 1
-        self.log_matrix("Rozwiązanie początkowe (NW)")
-        self.log(f"Koszt/Zysk rozwiązania początkowego: {self.get_total_cost():.2f}")
+            step += 1
+
+        self.log(f"Koszt/Zysk rozwiązania początkowego (NW): {self.get_total_cost():.2f}")
 
     def matrix_min_method(self):
         """Metoda Minimalnego Elementu Macierzy"""
-        self.log("\n>>> START: Metoda Minimalnego Elementu Macierzy")
+        self.log("\n Metoda minimalnego elementu macierzy")
         supply = self.supply.copy()
         demand = self.demand.copy()
         cells = []
@@ -161,98 +205,125 @@ class TransportSolver:
                 cells.append((self.cost_matrix[r, c], r, c))
         cells.sort(key=lambda x: x[0])
 
+        step = 1
         for cost, r, c in cells:
             if supply[r] > 0 and demand[c] > 0:
                 quantity = min(supply[r], demand[c])
                 self.allocation[r, c] = quantity
                 self.basic_vars[r, c] = True
-                self.log(f"Koszt {cost:.2f}: Przydzielono {quantity} -> Komórka [{r}, {c}]")
+                self.log(f"Krok Min. Macierzy {step}: Koszt {cost:.2f}: Przydzielono {quantity} -> Komórka [{r}, {c}]")
+                self.log_matrix(f"Min. Macierzy: Alokacja w kroku {step}")
+
                 supply[r] -= quantity
                 demand[c] -= quantity
-        self.log_matrix("Rozwiązanie początkowe (Min. Macierzy)")
-        self.log(f"Koszt/Zysk rozwiązania początkowego: {self.get_total_cost():.2f}")
+                step += 1
+
+        self.log(f"Koszt/Zysk rozwiązania początkowego (Min. Macierzy): {self.get_total_cost():.2f}")
 
     def row_min_method(self):
         """Metoda Minimalnego Elementu w Wierszu"""
-        self.log("\n>>> START: Metoda Minimalnego Elementu w Wierszu")
+        self.log("\nMetoda mnimalnego elementu w wierszu")
         supply = self.supply.copy()
         demand = self.demand.copy()
+        step = 1
 
         for r in range(self.rows):
             self.log(f"Analiza wiersza {r} (Dostawca {r})...")
-            while supply[r] > self.epsilon:
+
+            current_supply = supply.copy()
+            current_demand = demand.copy()
+
+            while current_supply[r] > self.epsilon:
                 min_cost = float('inf')
                 target_c = -1
                 for c in range(self.cols):
-                    if demand[c] > self.epsilon and self.cost_matrix[r, c] < min_cost:
+                    if current_demand[c] > self.epsilon and self.cost_matrix[r, c] < min_cost:
                         min_cost = self.cost_matrix[r, c]
                         target_c = c
 
                 if target_c == -1: break
 
-                quantity = min(supply[r], demand[target_c])
-                self.allocation[r, target_c] = quantity
+                quantity = min(current_supply[r], current_demand[target_c])
+
+                self.allocation[r, target_c] += quantity
                 self.basic_vars[r, target_c] = True
-                self.log(f"  Min w wierszu to koszt {min_cost:.2f}: Przydzielono {quantity} -> [{r}, {target_c}]")
+
+                self.log(
+                    f"Krok Min. Wiersza {step}: Min w wierszu to koszt {min_cost:.2f}: Przydzielono {quantity} -> [{r}, {target_c}]")
+                self.log_matrix(f"Min. Wiersza: Alokacja w kroku {step}")
+
+                current_supply[r] -= quantity
+                current_demand[target_c] -= quantity
                 supply[r] -= quantity
                 demand[target_c] -= quantity
-        self.log_matrix("Rozwiązanie początkowe (Min. Wiersza)")
-        self.log(f"Koszt/Zysk rozwiązania początkowego: {self.get_total_cost():.2f}")
+                step += 1
+
+        self.log(f"Koszt/Zysk rozwiązania początkowego (Min. Wiersza): {self.get_total_cost():.2f}")
 
     def col_min_method(self):
         """Metoda Minimalnego Elementu w Kolumnie"""
-        self.log("\n>>> START: Metoda Minimalnego Elementu w Kolumnie")
+        self.log("\nMetoda minimalnego elementu w kolumnie")
         supply = self.supply.copy()
         demand = self.demand.copy()
+        step = 1
 
         for c in range(self.cols):
             self.log(f"Analiza kolumny {c} (Odbiorca {c})...")
-            while demand[c] > self.epsilon:
+
+            current_supply = supply.copy()
+            current_demand = demand.copy()
+
+            while current_demand[c] > self.epsilon:
                 min_cost = float('inf')
                 target_r = -1
                 for r in range(self.rows):
-                    if supply[r] > self.epsilon and self.cost_matrix[r, c] < min_cost:
+                    if current_supply[r] > self.epsilon and self.cost_matrix[r, c] < min_cost:
                         min_cost = self.cost_matrix[r, c]
                         target_r = r
 
                 if target_r == -1: break
 
-                quantity = min(supply[target_r], demand[c])
-                self.allocation[target_r, c] = quantity
+                quantity = min(current_supply[target_r], current_demand[c])
+
+                self.allocation[target_r, c] += quantity
                 self.basic_vars[target_r, c] = True
-                self.log(f"  Min w kolumnie to koszt {min_cost:.2f}: Przydzielono {quantity} -> [{target_r}, {c}]")
+
+                self.log(
+                    f"Krok Min. Kolumny {step}: Min w kolumnie to koszt {min_cost:.2f}: Przydzielono {quantity} -> [{target_r}, {c}]")
+                self.log_matrix(f"Min. Kolumny: Alokacja w kroku {step}")
+
+                current_supply[target_r] -= quantity
+                current_demand[c] -= quantity
                 supply[target_r] -= quantity
                 demand[c] -= quantity
-        self.log_matrix("Rozwiązanie początkowe (Min. Kolumny)")
-        self.log(f"Koszt/Zysk rozwiązania początkowego: {self.get_total_cost():.2f}")
+                step += 1
 
-    # --- METODA POTENCJAŁÓW (POPRAWIONA LOGIKA CYKLU) ---
+        self.log(f"Koszt/Zysk rozwiązania początkowego (Min. Kolumny): {self.get_total_cost():.2f}")
+
+    # --- METODA POTENCJAŁÓW ---
 
     def solve_potentials(self):
         """Główna pętla metody potencjałów"""
         self.log("\n==========================================")
-        self.log(" ROZPOCZYNAM OPTYMALIZACJĘ METODĄ POTENCJAŁÓW")
+        self.log(" Metoda potencjałów")
         self.log("==========================================")
 
         iteration = 0
         initial_cost = self.get_total_cost()
-        max_iterations = self.rows * self.cols * 2  # Ograniczenie liczby iteracji
+        max_iterations = self.rows * self.cols * 2
 
         while iteration < max_iterations:
             iteration += 1
-            self.log(f"\n--- ITERACJA {iteration} (Koszt: {initial_cost:.2f}) ---")
+            self.log(f"\n--- Iteracja {iteration} (Koszt: {initial_cost:.2f}) ---")
 
-            # Krok 1: Obsługa degeneracji (jeśli liczba zmiennych bazowych jest zbyt mała)
             self.handle_degeneracy()
 
-            # Krok 2: Obliczanie potencjałów (u i v)
-            u, v = self.calculate_uv()
+            u, v = self.calculate_uv_without_degeneracy_fix()
 
             if None in u or None in v:
-                self.log("Błąd krytyczny: Nie można obliczyć wszystkich potencjałów. Prawdopodobna niestabilność bazy.")
+                self.log("Błąd: Niestabilna baza")
                 break
 
-            # Krok 3: Obliczanie macierzy delt (kosztów względnych)
             deltas = []
             for r in range(self.rows):
                 for c in range(self.cols):
@@ -260,108 +331,81 @@ class TransportSolver:
                         delta = self.cost_matrix[r, c] - (u[r] + v[c])
                         deltas.append((delta, r, c))
 
-            # Kryterium optymalności (Min: delta >= 0 ; Max: delta <= 0)
+            # Warunek optymalności: Wszystkie delty >= 0
+            if not deltas or min(d[0] for d in deltas) >= -self.epsilon:
+                self.log("\nWszystkie delty >= 0. Rozwiązanie jest optymalne")
+                self.log_matrix("Rozwiązanie jest optymalne")
+                break
+
+            # Wybór zmiennej wchodzącej: Najbardziej ujemna delta
+            entering = min(deltas, key=lambda x: x[0])
+
+            # Dopasowanie komunikatu do trybu
             if self.type == 'min':
-                # Szukamy najmniejszej ujemnej delty (Delta < -epsilon)
-                if not deltas or min(d[0] for d in deltas) >= -self.epsilon:
-                    self.log("\n>>> KONIEC: Wszystkie delty >= 0. Rozwiązanie jest optymalne!")
-                    break
-                # Najbardziej ujemna delta (zmienna wchodząca)
-                entering = min(deltas, key=lambda x: x[0])
-                self.log(f"Rozwiązanie nieoptymalne. Najbardziej ujemna delta: {entering[0]:.2f}")
-            else:  # self.type == 'max' (Pracujemy na macierzy -C, więc szukamy max ujemnej, czyli min C)
-                # Szukamy największej dodatniej delty (Delta > epsilon)
-                # Macierz kosztów jest zanegowana, więc delta = -cost_original - (u+v)
-                # Musimy szukać największej dodatniej delty, co odpowiada najmniejszemu ujemnemu kosztowi względnemu w oryginalnym problemie.
-                if not deltas or max(d[0] for d in deltas) <= self.epsilon:
-                    self.log(
-                        "\n>>> KONIEC: Wszystkie delty <= 0 (w problemie min. negatywnych kosztów). Rozwiązanie jest optymalne!")
-                    break
-                # Najbardziej dodatnia delta
-                entering = max(deltas, key=lambda x: x[0])
                 self.log(
-                    f"Rozwiązanie nieoptymalne. Najbardziej dodatnia delta: {entering[0]:.2f} (Największy potencjał poprawy zysku).")
+                    rf"Rozwiązanie nieoptymalne. Najbardziej ujemna delta {entering[0]:.2f}")
+            else:  # type == 'max'
+                # Delta dla pierwotnego zysku to -Delta_kosztu
+                original_gain_delta = -entering[0]
+                self.log(
+                    rf"Rozwiązanie nieoptymalne. Największy wzrost zysku na jednostkę: {original_gain_delta:+.2f}")
 
             start_node = (entering[1], entering[2])
             self.log(f"Zmienna wchodząca do bazy: Wiersz {start_node[0]}, Kolumna {start_node[1]}")
 
-            # Krok 4: Znalezienie cyklu
             path = self.find_cycle(start_node)
 
             if not path:
-                self.log("Błąd: Nie znaleziono poprawnego cyklu zamkniętego. Optymalizacja zatrzymana.")
+                self.log("Błąd: Nie znaleziono poprawnego cyklu")
                 break
 
             path_str = " -> ".join([f"[{r},{c}]" for r, c in path])
             self.log(f"Znaleziono cykl: [{start_node[0]},{start_node[1]}] (+) -> {path_str}")
 
-            # Krok 5: Wyznaczanie theta (minimum z pól ujemnych)
             minus_cells_values = []
-
-            # W cyklu: start_node (+), path[0] (-), path[1] (+), path[2] (-), ...
-            # Pola ujemne to path[0], path[2], path[4], ... (indeksy parzyste w path)
             for i in range(len(path)):
-                if (i + 1) % 2 != 0:  # Indeksy 0, 2, 4, ...
+                if (i + 1) % 2 != 0:
                     r, c = path[i]
                     minus_cells_values.append((self.allocation[r, c], r, c))
 
-            if not minus_cells_values:
-                self.log("Błąd: Błąd cyklu (brak pól ujemnych do wyboru theta).")
-                break
+            if not minus_cells_values: break
 
-            # Theta to najmniejsza alokacja w polach ujemnych
-            theta = min(m[0] for m in minus_cells_values)
+            theta_val, r_leave, c_leave = min(minus_cells_values, key=lambda x: x[0])
+            theta = max(0.0, theta_val)
 
             if theta < self.epsilon:
                 theta = 0
-                self.log(f"Wartość przesunięcia (theta) = 0.00. Wymiana zmiennej bazowej (degeneracja).")
+                self.log(f"Wartość przesunięcia = 0.00. Zmiana zmiennej bazowej")
             else:
-                self.log(f"Wartość przesunięcia (theta) = {theta:.2f}")
+                self.log(f"Wartość przesunięcia = {theta:.2f}")
 
-            # --- Krok 6: Przejście do nowego rozwiązania bazowego ---
-
-            # 1. Zmienna wchodząca do bazy
             self.allocation[start_node] += theta
             self.basic_vars[start_node] = True
 
             leaving_vars_candidates = []
 
-            # 2. Aktualizacja zmiennych wzdłuż cyklu (path)
             for i, (r, c) in enumerate(path):
-                # path[i] odpowiada pozycji, która powinna mieć znak (-1)^(i+1)
-                sign = (-1) ** (i + 1)  # i=0 -> (-1), i=1 -> (+1), i=2 -> (-1)
-
+                sign = (-1) ** (i + 1)
                 self.allocation[r, c] += sign * theta
 
-                # Kandydaci na zmienne opuszczające bazę (alokacja bliska zera)
                 if abs(self.allocation[r, c]) < self.epsilon and self.basic_vars[r, c]:
-                    self.allocation[r, c] = 0  # Wymuszenie zera
+                    self.allocation[r, c] = 0
                     leaving_vars_candidates.append((r, c))
 
-            # 3. Kryterium wyjścia: Usuwamy tylko jedną zmienną z bazy
-            if not leaving_vars_candidates:
-                self.log("Błąd: Żadna zmienna nie opuściła bazy (brak zera w półcyklu ujemnym).")
-                break
+            if not leaving_vars_candidates: break
 
-            # W przypadku degeneracji (theta=0 lub więcej niż jeden kandydat)
-            # Wybieramy tego kandydata, który jest w zbiorze minus_cells_values, a następnie wybieramy jeden z nich.
+            r_out, c_out = min(leaving_vars_candidates, key=lambda x: (x[0], x[1]))
+            self.basic_vars[r_out, c_out] = False
+            self.log(f"Zmienna opuszczająca bazę:  [{r_out},{c_out}]")
 
-            # Wystarczy wybrać dowolną zmienną z listy kandydatów
-            r, c = leaving_vars_candidates[0]
-            self.basic_vars[r, c] = False
-            self.log(f"Zmienna opuszczająca bazę: [{r},{c}]")
-
-            # Weryfikacja kosztu (musi maleć lub być stały)
             new_cost = self.get_total_cost()
             self.log(f"Łączny koszt/zysk po iteracji: {new_cost:.2f}")
 
-            # Sprawdzanie, czy koszt nie wzrósł (dla min)
             if self.type == 'min' and new_cost > initial_cost + self.epsilon:
-                self.log(f"!!! KRYTYCZNY BŁĄD !!! KOSZT WZRÓSŁ: {initial_cost:.2f} -> {new_cost:.2f}")
+                self.log(f"Błąd koszt się zwiększył: {initial_cost:.2f} -> {new_cost:.2f}")
                 break
-            # Sprawdzanie, czy zysk nie zmalał (dla max)
             elif self.type == 'max' and new_cost < initial_cost - self.epsilon:
-                self.log(f"!!! KRYTYCZNY BŁĄD !!! ZYSK ZMALAŁ: {initial_cost:.2f} -> {new_cost:.2f}")
+                self.log(f"Błąd zysk zmalał: {initial_cost:.2f} -> {new_cost:.2f}")
                 break
 
             initial_cost = new_cost
@@ -369,52 +413,36 @@ class TransportSolver:
             self.log_matrix(f"Tabela po iteracji {iteration}")
 
     def handle_degeneracy(self):
-        # Sprawdzanie i usuwanie zer bazowych, które nie są niezbędne
-
         num_basic = np.sum(self.basic_vars)
         required = self.rows + self.cols - 1
 
         if num_basic > required:
-            # Nadmierna liczba zmiennych bazowych - usuwamy zbędne '0*'
-            self.log(f"[!] Nadmiar bazowych: {num_basic} > {required}. Usuwam zbędne '0*'.")
+            self.log(f"Nadmiar bazowych: {num_basic} > {required}")
             removed_count = 0
 
-            # Szukamy zmiennych bazowych z alokacją 0
             for r in range(self.rows):
                 for c in range(self.cols):
                     if self.basic_vars[r, c] and abs(self.allocation[r, c]) < self.epsilon:
-                        # Sprawdzamy, czy usunięcie tej zmiennej nie spowoduje problemu
-
-                        # Tymczasowo usuwamy z bazy
                         self.basic_vars[r, c] = False
-
-                        # Upewniamy się, że pozostałe bazowe nadal pozwalają na obliczenie u/v
                         u, v = self.calculate_uv_without_degeneracy_fix()
 
                         if None not in u and None not in v:
-                            # Nadal da się obliczyć u/v, więc ta zmienna była zbędna
                             self.log(f"    Usunięto zbędne zero bazowe z [{r},{c}].")
                             removed_count += 1
                         else:
-                            # Ta zmienna bazowa jest niezbędna do obliczenia u/v
                             self.basic_vars[r, c] = True
 
-                        if np.sum(self.basic_vars) == required:
-                            break
-                if np.sum(self.basic_vars) == required:
-                    break
+                        if np.sum(self.basic_vars) == required: break
+                if np.sum(self.basic_vars) == required: break
 
-            if removed_count > 0:
-                self.log(f"    Usunięto {removed_count} zbędnych zer bazowych.")
+            if removed_count > 0: self.log(f"    Usunięto {removed_count} zbędnych zer bazowych.")
 
-        # Dodawanie zer bazowych (jeśli liczba zmiennych bazowych jest zbyt mała)
         num_basic = np.sum(self.basic_vars)
         if num_basic < required:
             diff = required - num_basic
-            self.log(f"[!] DEGENERACJA: Liczba zmiennych bazowych {num_basic} < {required}. Dodaję zera bazowe.")
+            self.log(f"Liczba zmiennych bazowych {num_basic} < {required}. Dodaję zera bazowe.")
             added = 0
 
-            # Wyszukujemy najlepszych kandydatów (najmniejszy koszt)
             candidates = []
             for r in range(self.rows):
                 for c in range(self.cols):
@@ -425,31 +453,21 @@ class TransportSolver:
 
             for cost, r, c in candidates:
                 if added >= diff: break
-
-                # Dodajemy tymczasowo jako bazowe
                 self.basic_vars[r, c] = True
-
-                # Sprawdzamy, czy dodanie nie tworzy cyklu (czyli czy u/v jest rozwiązywalne)
                 u, v = self.calculate_uv_without_degeneracy_fix()
 
                 if None in u or None in v:
-                    # Dodanie stworzyło cykl w bazie - cofamy
                     self.basic_vars[r, c] = False
                 else:
-                    # Jest to dobre pole do dodania
                     self.allocation[r, c] = 0
                     self.log(f"    Dodano zero bazowe (0*) do pola [{r},{c}] (koszt {cost:.2f}).")
                     added += 1
 
-            if added < diff:
-                self.log(
-                    "!!! Ostrzeżenie !!! Nie udało się dodać wystarczającej liczby zer bazowych do stworzenia niecyklicznej bazy.")
-
     def calculate_uv_without_degeneracy_fix(self):
-        # Funkcja pomocnicza do sprawdzania, czy można obliczyć u/v
         u = [None] * self.rows
         v = [None] * self.cols
-        u[0] = 0.0
+        if self.rows > 0:
+            u[0] = 0.0
         changed = True
 
         while changed and (None in u or None in v):
@@ -465,73 +483,47 @@ class TransportSolver:
                             changed = True
         return u, v
 
-    def calculate_uv(self):
-        # Główna funkcja obliczająca u/v
-        u, v = self.calculate_uv_without_degeneracy_fix()
-
-        # Opcjonalnie: Ustawienie pozostałych None na 0.0 w przypadku cyklu zerowego w bazie
-        # W normalnym przypadku, jeśli handle_degeneracy działa, nie powinno być None
-        u = [0.0 if x is None else x for x in u]
-        v = [0.0 if x is None else x for x in v]
-
-        return u, v
-
     def find_cycle(self, start_pos):
-        """
-        [POPRAWIONA IMPLEMENTACJA]
-        Znajduje zamkniętą ścieżkę (cykl) dla zmiennej wchodzącej start_pos
-        używając tylko zmiennych bazowych. Wykorzystuje DFS.
-        """
         r_start, c_start = start_pos
-        # Tymczasowe włączenie zmiennej wchodzącej do bazy
         self.basic_vars[r_start, c_start] = True
 
-        # path to lista krotek (r, c)
         def dfs_cycle_search(current_pos, path, mode):
             r, c = current_pos
 
-            # Wyszukiwanie sąsiadów - tylko wzdłuż zmiennych bazowych
             neighbors = []
-            if mode == 'row':  # Szukamy w kolumnie (ruch poziomy)
+            if mode == 'row':
                 for j in range(self.cols):
                     if j != c and self.basic_vars[r, j]:
                         neighbors.append((r, j))
-            else:  # mode == 'col' # Szukamy w wierszu (ruch pionowy)
+            else:
                 for i in range(self.rows):
                     if i != r and self.basic_vars[i, c]:
                         neighbors.append((i, c))
 
-            # Właściwy ruch: przełączanie z wiersza na kolumnę i na odwrót
             next_mode = 'col' if mode == 'row' else 'row'
 
             for n in neighbors:
-                # Jeśli wróciliśmy do punktu startowego, znaleźliśmy cykl.
-                # Cykl musi mieć co najmniej 4 wierzchołki: start -> A -> B -> start. (3 w path)
                 if n == start_pos and len(path) >= 3:
                     return True
 
-                # Jeśli sąsiad nie jest jeszcze w ścieżce
                 if n not in path:
                     path.append(n)
                     if dfs_cycle_search(n, path, next_mode):
                         return True
-                    path.pop()  # Backtrack
+                    path.pop()
 
             return False
 
         cycle = []
-        # Próba rozpoczęcia ruchu w poziomie
         if dfs_cycle_search(start_pos, cycle, 'row'):
             self.basic_vars[r_start, c_start] = False
             return cycle
 
         cycle = []
-        # Próba rozpoczęcia ruchu w pionie
         if dfs_cycle_search(start_pos, cycle, 'col'):
             self.basic_vars[r_start, c_start] = False
             return cycle
 
-        # Usuwamy tymczasowe włączenie, jeśli cykl nie został znaleziony
         self.basic_vars[r_start, c_start] = False
         return None
 
@@ -549,18 +541,16 @@ class TransportSolver:
                     total += alloc * cost
 
         if self.type == 'max':
-            # Jeśli tryb to 'max', macierz cost_matrix była zanegowana,
-            # więc wynik jest ujemny. Zwracamy -total, aby dostać zysk.
-            return -total
+            return -total  # zwracamy pierwotny zysk
         return total
 
 
-# --- INTERFEJS GRAFICZNY (bez zmian) ---
+# --- INTERFEJS GRAFICZNY (APP) ---
 class TransportApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Rozwiązywanie Zadania Transportowego i Przydziału")
-        self.root.geometry("1000x750")
+        self.root.title("Rozwiązywanie zadania transportowego")
+        self.root.geometry("1000x800")
 
         # --- MENU GÓRNE (POMOC) ---
         menubar = tk.Menu(self.root)
@@ -574,7 +564,6 @@ class TransportApp:
         control_frame = ttk.LabelFrame(root, text="Ustawienia")
         control_frame.pack(fill="x", padx=10, pady=5)
 
-        # Wybór metody startowej
         ttk.Label(control_frame, text="Metoda startowa:").grid(row=0, column=0, padx=5, pady=5)
         self.method_var = tk.StringVar(value="matrix_min")
         methods = [
@@ -588,7 +577,6 @@ class TransportApp:
         self.method_combo.grid(row=0, column=1, padx=5, pady=5)
         self.method_map = {m[0]: m[1] for m in methods}
 
-        # Typ optymalizacji
         ttk.Label(control_frame, text="Cel:").grid(row=0, column=2, padx=5, pady=5)
         self.opt_type = tk.StringVar(value="min")
         ttk.Radiobutton(control_frame, text="Minimalizacja Kosztów", variable=self.opt_type, value="min").grid(row=0,
@@ -596,7 +584,6 @@ class TransportApp:
         ttk.Radiobutton(control_frame, text="Maksymalizacja Zysku", variable=self.opt_type, value="max").grid(row=0,
                                                                                                               column=4)
 
-        # Wymiary
         ttk.Label(control_frame, text="Dostawcy:").grid(row=1, column=0)
         self.rows_entry = ttk.Entry(control_frame, width=5)
         self.rows_entry.insert(0, "3")
@@ -609,7 +596,6 @@ class TransportApp:
 
         ttk.Button(control_frame, text="Generuj Tabelę", command=self.generate_table).grid(row=1, column=5, padx=10)
 
-        # Presety zadań
         ttk.Label(control_frame, text="Przykłady:").grid(row=2, column=0)
         self.preset_combo = ttk.Combobox(control_frame, values=[
             "Zadanie 1 (3x4 Min)",
@@ -618,7 +604,6 @@ class TransportApp:
             "Zadanie 5 (3x3 Min - Niezbilansowane)",
             "Zadanie 6 (3x4 Min - Koszty z odl.)",
             "Zadanie 7 (3x4 Min - Niezbilansowane)",
-            "Zadanie 8 (3x4 Min - to samo co Zad 4)",
             "Zadanie 9 (4x3 Min)",
             "Zadanie 10 (4x3 Max)",
             "Zadanie 13 (3x4 Min - Czas)",
@@ -628,24 +613,28 @@ class TransportApp:
         self.preset_combo.grid(row=2, column=1, columnspan=2)
         ttk.Button(control_frame, text="Załaduj Przykład", command=self.load_preset).grid(row=2, column=3)
 
-        # --- Panel Tabeli ---
-        self.table_frame = ttk.Frame(root)
-        self.table_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        # --- Panel Tabeli Danych Wejściowych ---
+        self.table_frame = ttk.LabelFrame(root, text="Dane wejściowe")
+        self.table_frame.pack(fill="x", padx=10, pady=5)
 
-        # --- Panel Wyników ---
+        # --- Panel Wyników i Logów ---
         bottom_frame = ttk.Frame(root)
         bottom_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        ttk.Button(bottom_frame, text="ROZWIĄŻ (Metoda Potencjałów)", command=self.solve).pack(pady=5)
+        ttk.Button(bottom_frame, text="Rozwiąż", command=self.solve).pack(pady=5)
 
-        self.log_text = tk.Text(bottom_frame, height=15)
+        self.log_text = tk.Text(bottom_frame, height=35, wrap=tk.NONE)
         self.log_text.pack(fill="both", expand=True)
+
+        # Dodanie suwaka poziomego do pola logów
+        self.h_scrollbar = ttk.Scrollbar(self.log_text, orient=tk.HORIZONTAL, command=self.log_text.xview)
+        self.log_text.config(xscrollcommand=self.h_scrollbar.set)
+        self.h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.cells = []
         self.supply_entries = []
         self.demand_entries = []
 
-        # Startowa tabela
         self.generate_table()
 
     def load_preset(self):
@@ -656,35 +645,26 @@ class TransportApp:
         supply = []
         demand = []
 
-        # --- ZADANIE 1 ---
         if "Zadanie 1 " in selection:
             costs = [[10, 40, 50, 20], [20, 60, 40, 60], [30, 30, 30, 40]]
             supply = [300, 450, 800]
             demand = [630, 160, 170, 340]
             self.opt_type.set("min")
-
-        # --- ZADANIE 2 (Wymyślone dla testów - przydział) ---
         elif "Zadanie 2" in selection:
             costs = [[30, 50, 60, 80], [40, 80, 70, 100], [60, 40, 50, 30], [90, 60, 60, 70]]
             supply = [1, 1, 1, 1]
             demand = [1, 1, 1, 1]
             self.opt_type.set("max")
-
-        # --- ZADANIE 4/8 (Hurtownie - Wymyślone) ---
         elif "Zadanie 4" in selection or "Zadanie 8" in selection:
             costs = [[3, 4, 7, 1], [5, 1, 3, 2], [2, 4, 5, 4]]
             supply = [100, 150, 100]
             demand = [80, 120, 120, 30]
             self.opt_type.set("min")
-
-        # --- ZADANIE 5 (Bawełna. Popyt > Podaż - Wymyślone) ---
         elif "Zadanie 5" in selection:
             costs = [[3, 7, 4], [4, 9, 6]]
             supply = [100, 200]
             demand = [80, 150, 170]
             self.opt_type.set("min")
-
-        # --- ZADANIE 6 (Koszty z odl. - Wymyślone) ---
         elif "Zadanie 6" in selection:
             dist = [[76, 20, 30, 36], [20, 10, 40, 24], [18, 44, 10, 16]]
             coeffs = [0.5, 1.0, 2.0]
@@ -695,54 +675,40 @@ class TransportApp:
             supply = [1200, 900, 900]
             demand = [600, 500, 800, 700]
             self.opt_type.set("min")
-
-        # --- ZADANIE 7 (Tartaki. Popyt > Podaż - Wymyślone) ---
         elif "Zadanie 7" in selection:
             costs = [[10, 40, 50, 20], [20, 60, 40, 60], [30, 30, 30, 40]]
             supply = [400, 600, 550]
             demand = [500, 350, 300, 700]
             self.opt_type.set("min")
-
-        # --- ZADANIE 9 (Krosna. Min. nakładów - Wymyślone) ---
         elif "Zadanie 9" in selection:
             costs = [[9, 5, 3], [7, 8, 2], [2, 10, 5], [4, 6, 7]]
             supply = [20, 30, 25, 40]
             demand = [16, 34, 50]
             self.opt_type.set("min")
-
-        # --- ZADANIE 10 (Jabłka. Max. zysku - Wymyślone) ---
         elif "Zadanie 10" in selection:
             costs = [[1, 3, 4], [5, 8, 6], [1, 2, 5], [2, 1, 7]]
             supply = [600, 500, 300, 400]
             demand = [300, 900, 600]
             self.opt_type.set("max")
-
-        # --- ZADANIE 13 (Mleczarnie. Min. czasu - Wymyślone) ---
         elif "Zadanie 13" in selection:
             costs = [[1, 3, 7, 2], [2, 2, 2, 3], [1, 3, 6, 5]]
             supply = [100, 200, 150]
             demand = [80, 170, 90, 110]
             self.opt_type.set("min")
-
-        # --- ZADANIE 14a (Warzywa - Wymyślone) ---
         elif "Zadanie 14a" in selection:
             costs = [[40, 80, 60], [30, 60, 50], [90, 40, 30]]
             supply = [70, 30, 100]
             demand = [50, 60, 90]
             self.opt_type.set("min")
-
-        # --- ZADANIE 14b (Warzywa. Blokada trasy - Wymyślone) ---
         elif "Zadanie 14b" in selection:
             costs = [[40, 80, 60], [30, 60, 50], [90, 40, 30]]
-            costs[1][0] = float('inf')  # Blokada
+            costs[1][0] = float('inf')
             supply = [70, 30, 100]
             demand = [50, 60, 90]
             self.opt_type.set("min")
-
         else:
             return
 
-        # Wypełnij GUI danymi
         self.rows_entry.delete(0, tk.END);
         self.rows_entry.insert(0, str(len(costs)))
         self.cols_entry.delete(0, tk.END);
@@ -756,9 +722,8 @@ class TransportApp:
             for j in range(len(costs[0])):
                 if i < len(self.cells) and j < len(self.cells[i]):
                     self.cells[i][j].delete(0, tk.END)
-                    # Wstaw 'inf' dla nieskończonych kosztów
                     val = str(costs[i][j])
-                    if val == "inf":
+                    if val.lower() == "inf":
                         val = "inf"
                     self.cells[i][j].insert(0, val)
 
@@ -781,13 +746,11 @@ class TransportApp:
         self.supply_entries = []
         self.demand_entries = []
 
-        # Nagłówki
         ttk.Label(self.table_frame, text="Dost\\Odb").grid(row=0, column=0)
         for j in range(cols):
             ttk.Label(self.table_frame, text=f"Odb {j + 1}").grid(row=0, column=j + 1)
         ttk.Label(self.table_frame, text="Podaż").grid(row=0, column=cols + 1)
 
-        # Macierz
         for i in range(rows):
             ttk.Label(self.table_frame, text=f"Dost {i + 1}").grid(row=i + 1, column=0)
             row_cells = []
@@ -798,13 +761,11 @@ class TransportApp:
                 row_cells.append(e)
             self.cells.append(row_cells)
 
-            # Podaż
             s = ttk.Entry(self.table_frame, width=8)
             s.grid(row=i + 1, column=cols + 1, padx=5)
             s.insert(0, "0")
             self.supply_entries.append(s)
 
-        # Popyt
         ttk.Label(self.table_frame, text="Popyt").grid(row=rows + 1, column=0)
         for j in range(cols):
             d = ttk.Entry(self.table_frame, width=8)
@@ -812,8 +773,117 @@ class TransportApp:
             d.insert(0, "0")
             self.demand_entries.append(d)
 
+    def format_step_table(self, data, step_index):
+        """
+        Generuje JEDNOLINIOWY, sformatowany tekst tabeli dla danego kroku,
+        używany GŁÓWNIE dla iteracji MODI.
+        """
+        rows = data['rows']
+        cols = data['cols']
+        u = data['u']
+        v = data['v']
+
+        # Sprawdzenie, czy to jest krok startowy (który nie ma jeszcze obliczonych U/V
+        # ani delty)
+        is_initial_step = (None in u or None in v)
+
+        # Zwiększona szerokość kolumny, aby pomieścić C, X i Delta w jednej linii
+        CELL_WIDTH = 25
+        COL_HEADER_WIDTH = 10
+        SIDE_WIDTH = 12
+
+        output = [
+            f"\n\n=========================================================================================",
+            f"Krok {step_index + 1}: {data['title']} (Koszt/Zysk: {data['cost']:.2f})",
+            f"========================================================================================="
+        ]
+
+        # 1. Nagłówki kolumn
+        header_parts = [f"{'Dost\\Odb':<{SIDE_WIDTH}}"]
+        for j in range(cols):
+            header_parts.append(f"| {'Odb ' + str(j + 1):^{CELL_WIDTH}}")
+        header_parts.append(f"| {'Podaż':^{COL_HEADER_WIDTH}}")
+        header_parts.append(f"| {'U':^{SIDE_WIDTH}} |")
+        output.append("".join(header_parts))
+        output.append("-" * (SIDE_WIDTH + (CELL_WIDTH + 2) * cols + (COL_HEADER_WIDTH + 2) + SIDE_WIDTH + 3))
+
+        # 2. Wiersze danych (Alokacja + Koszt/Delta)
+        for i in range(rows):
+            row_parts = [f"{'Dost ' + str(i + 1):<{SIDE_WIDTH}}"]
+            for j in range(cols):
+                alloc_val = data['pretty_table_data'][i][j]
+                is_basic = data['basic_vars'][i, j]
+                cost_val = data['cost_matrix'][i, j]
+
+                # Formatowanie C (Koszt) / Zysk (dla trybu max)
+                cost_text = ""
+                if self.opt_type.get() == 'max':
+                    original_cost_val = -cost_val
+                    # Wyświetl zysk
+                    if abs(original_cost_val) > 10000:
+                        cost_text = f"Zysk=INF" if original_cost_val > 0 else "Zysk=-INF"
+                    else:
+                        cost_text = f"Zysk={original_cost_val:.0f}"
+                else:
+                    # Wyświetl koszt
+                    cost_text = f"C={cost_val:.0f}" if cost_val != float('inf') and abs(
+                        cost_val) < 10000 else "C=INF"
+
+                # Formatowanie Delta (tylko dla kroków MODI)
+                delta_text = ""
+                if not is_initial_step and not is_basic:
+                    delta = cost_val - (u[i] + v[j])
+
+                    if self.opt_type.get() == 'max':
+                        # W trybie 'max' pokazujemy różnicę pierwotnego zysku: Delta_ZYSKU = -Delta_KOSZTU
+                        delta_gain = -delta
+                        delta_text = f" \u0394Z={delta_gain:+.2f}"
+                    else:
+                        delta_text = f" \u0394C={delta:+.2f}"  # znak + dla lepszej czytelności
+
+                # Łączenie w jedną linię: [X=...* C=... Delta=...]
+                basic_mark = '*' if is_basic else ' '
+                cell_content = f"X:{alloc_val}{basic_mark} | {cost_text}{delta_text}"
+
+                row_parts.append(f"| {cell_content:<{CELL_WIDTH}}")
+
+            # Podaż i Potencjał U
+            supply_val = data['pretty_table_data'][i][cols]
+            u_val_raw = u[i]
+            u_val = f"{u_val_raw:+.2f}" if u_val_raw is not None else "---"
+
+            row_parts.append(f"| {supply_val:>{COL_HEADER_WIDTH}}")
+            row_parts.append(f"| {u_val:^{SIDE_WIDTH}} |")
+
+            output.append("".join(row_parts))
+            output.append("-" * (SIDE_WIDTH + (CELL_WIDTH + 2) * cols + (COL_HEADER_WIDTH + 2) + SIDE_WIDTH + 3))
+
+        # 3. Wiersz Popytu
+        demand_row_parts = [f"{'Popyt':<{SIDE_WIDTH}}"]
+        for j in range(cols):
+            demand_val = data['pretty_table_data'][rows][j]
+            demand_row_parts.append(f"| {demand_val:^{CELL_WIDTH}}")
+
+        demand_row_parts.append(f"| {'':^{COL_HEADER_WIDTH}}")
+        demand_row_parts.append(f"| {'':^{SIDE_WIDTH}} |")
+        output.append("".join(demand_row_parts))
+        output.append("-" * (SIDE_WIDTH + (CELL_WIDTH + 2) * cols + (COL_HEADER_WIDTH + 2) + SIDE_WIDTH + 3))
+
+        # 4. Wiersz Potencjałów V
+        v_row_parts = [f"{'V':<{SIDE_WIDTH}}"]
+        for j in range(cols):
+            v_val_raw = v[j]
+            v_val = f"{v_val_raw:+.2f}" if v_val_raw is not None else "---"
+            v_row_parts.append(f"| {v_val:^{CELL_WIDTH}}")
+
+        v_row_parts.append(f"| {'':^{COL_HEADER_WIDTH}}")
+        v_row_parts.append(f"| {'':^{SIDE_WIDTH}} |")
+        output.append("".join(v_row_parts))
+        output.append("\n")
+
+        return "\n".join(output)
+
     def solve(self):
-        # Pobierz dane
         try:
             rows = int(self.rows_entry.get())
             cols = int(self.cols_entry.get())
@@ -834,11 +904,9 @@ class TransportApp:
             messagebox.showerror("Błąd", "Wprowadź poprawne liczby.")
             return
 
-        # Utwórz solver
         solver = TransportSolver(cost_matrix, supply, demand, type=self.opt_type.get())
         solver.prepare_data()
 
-        # Wybierz metodę startową
         method_name = self.method_combo.get()
         method_key = self.method_map[method_name]
 
@@ -851,38 +919,58 @@ class TransportApp:
         elif method_key == "col_min":
             solver.col_min_method()
 
-        # Rozwiąż
         solver.solve_potentials()
 
-        # Wyświetl logi
         self.log_text.delete(1.0, tk.END)
-        for log in solver.logs:
-            self.log_text.insert(tk.END, log + "\n")
 
-        # Pokaż wynik końcowy w logach
-        self.log_text.insert(tk.END, "\n--- MACIERZ ALOKACJI KOŃCOWEJ ---\n")
-        self.log_text.insert(tk.END, str(solver.allocation))
+        # 1. Wypisz Logi operacyjne (W TYM KLASYCZNE TABELE POCZĄTKOWE)
+
+        # Lista logów do pominięcia (dotyczy zwięzłego logowania MODI, które nie jest tabelą)
+        skipped_logs = []
+        for log in solver.logs:
+            # W logach pozostawiamy wszystko, w tym tabele startowe (z display_table_in_logs)
+            self.log_text.insert(tk.END, log + "\n")
+            # Dodatkowo, zapisujemy logi z MODI, które powielają się poniżej (np. --- Iteracja 1 ---)
+            if "Iteracja" in log or "Rozwiązanie jest optymalne" in log:
+                skipped_logs.append(log)
+
+        self.log_text.insert(tk.END, "\n\n" + "=" * 50 + "\n")
+        self.log_text.insert(tk.END, "--- Rozwiązanie krok po kroku ---\n")
+        self.log_text.insert(tk.END, "=" * 50 + "\n")
+
+        # 2. Wypisz Tabela Krok po Kroku (TYLKO KROKI MODI)
+        modi_step_index = 0
+        for i, step_data in enumerate(solver.step_by_step_data):
+            # Sprawdzamy, czy u i v zostały obliczone (oznacza krok MODI)
+            if None not in step_data['u'] and None not in step_data['v']:
+                # Jeśli to jest krok MODI, wyświetlamy go w formacie jednoliniiowym
+                formatted_table = self.format_step_table(step_data, modi_step_index)
+                self.log_text.insert(tk.END, formatted_table + "\n\n")
+                modi_step_index += 1
+
+        # 3. Pokaż wynik końcowy
         total = solver.get_total_cost()
-        self.log_text.insert(tk.END, f"\n\nŁĄCZNY KOSZT/ZYSK OPTYMALNY: {total:.2f}")
+        opt_type_text = "zysk" if self.opt_type.get() == 'max' else "koszt"
+        self.log_text.insert(tk.END, f"\n\nOptymalny {opt_type_text}: {total:.2f}")
 
     def show_help_message(self):
         msg = (
             "INSTRUKCJA KORZYSTANIA Z PROGRAMU:\n\n"
-            "1. Wybierz metodę startową (np. Kąt Północno-Zachodni).\n"
+            "1. Wybierz metodę startową (np. Kąt  - zachodni).\n"
             "   Służy ona do znalezienia pierwszego rozwiązania.\n\n"
             "2. Wybierz cel: Minimalizacja kosztów (standard) lub\n"
             "   Maksymalizacja zysku (dla zadań z zyskiem).\n\n"
             "3. Wpisz liczbę dostawców i odbiorców, a następnie\n"
             "   kliknij 'Generuj Tabelę'.\n\n"
             "4. Uzupełnij tabelę danymi:\n"
-            "   - Środek: Jednostkowe koszty transportu (możesz wpisać 'inf' lub 'M' dla blokady trasy).\n"
+            "   - Środek: Jednostkowe koszty transportu.\n"
             "   - Prawa kolumna: Podaż (ile towaru ma dostawca).\n"
             "   - Dolny wiersz: Popyt (ile towaru potrzebuje odbiorca).\n\n"
             "5. Możesz też wybrać gotowy przykład z listy 'Przykłady'\n"
             "   i kliknąć 'Załaduj Przykład'.\n\n"
-            "6. Kliknij 'ROZWIĄŻ'. Program najpierw wyznaczy rozwiązanie\n"
+            "6. Kliknij 'Rozwiąż'. Program najpierw wyznaczy rozwiązanie\n"
             "   startowe wybraną metodą, a następnie zoptymalizuje je\n"
-            "   Metodą Potencjałów aż do wyniku idealnego."
+            "   Metodą Potencjałów aż do wyniku optymalnego."
         )
         messagebox.showinfo("Pomoc", msg)
 
